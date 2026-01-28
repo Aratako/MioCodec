@@ -1,0 +1,41 @@
+{
+  "base_config": "config/base.json",
+  "preprocess": {
+    "n_mel": 128,
+    "win_size": 2048,
+    "hop_size": 512,
+    "sample_rate": 44100,
+    "n_fft": 2048,
+    "fmin": 0,
+    "fmax": 22050,
+    "f0_min": 50,
+    "f0_max": 1100,
+    "pitch_bin": 256,
+    "pitch_max": 1100.0,
+    "pitch_min": 50.0,
+    "cut_mel_frame": 32,
+  },
+  "train": {
+    "random_seed": 114514,
+    "batch_size": 64,
+    "gradient_accumulation_step": 1,
+    "max_epoch": 1000000,
+    "save_checkpoint_stride": [
+      20
+    ],
+    "run_eval": [
+      true
+    ],
+    "sampler": {
+      "holistic_shuffle": true,
+      "drop_last": true
+    },
+    "dataloader": {
+      "num_worker": 32,
+      "pin_memory": true
+    },
+    "tracker": [
+      "tensorboard"
+    ],
+  }
+}

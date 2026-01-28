@@ -1,0 +1,109 @@
+model:
+  class_path: miocodec.model.MioCodecModel
+  init_args:
+    config:
+      # SSL Feature settings
+      local_ssl_layers: [6, 9]
+      global_ssl_layers: [1, 2]
+      normalize_ssl_features: true
+
+      # Down/up-sampling settings
+      downsample_factor: 2
+      mel_upsample_factor: 4
+      use_conv_downsample: true
+      mel_interpolation_mode: linear
+
+      # Audio settings (match Pupu-Vocoder mel specs)
+      sample_rate: 44100
+      n_fft: 2048
+      hop_length: 512
+      n_mels: 128
+      padding: same
+      mel_backend: pupu
+      mel_fmin: 0.0
+      mel_fmax: 22050.0
+      mel_win_length: 2048
+
+    ssl_feature_extractor:
+      class_path: miocodec.module.ssl_extractor.SSLFeatureExtractor
+      init_args:
+        model_name: wavlm_base_plus
+        output_layer: 9 # Use at most 9 layers
+        sample_rate: 44100 # Consistent to the target sample rate for reconstruction
+
+    local_encoder:
+      class_path: miocodec.module.transformer.Transformer
+      init_args:
+        dim: 768
+        n_layers: 6
+        n_heads: 12
+        window_size: 125
+        use_rope: true
+        rope_theta: 10000.0
+        max_seq_len: 512
+        use_flash_attention: true
+
+    local_quantizer:
+      class_path: miocodec.module.fsq.FiniteScalarQuantizer
+      init_args:
+        input_dim: 768 # Must match local encoder output dimension
+        output_dim: 768 # Must match feature decoder input dimension
+        levels: [8, 8, 8, 5, 5] # 12800
+
+    feature_decoder:
+      class_path: miocodec.module.transformer.Transformer
+      init_args:
+        dim: 768
+        n_layers: 6
+        n_heads: 12
+        window_size: 125
+        use_rope: true
+        rope_theta: 10000.0
+        max_seq_len: 512
+        use_flash_attention: true
+
+    global_encoder:
+      class_path: miocodec.module.global_encoder.GlobalEncoder
+      init_args:
+        input_channels: 768 # WavLM base plus feature dimension
+        output_channels: 128
+        num_layers: 4
+        dim: 384
+        intermediate_dim: 1152
+
+    mel_prenet:
+      class_path: miocodec.module.transformer.Transformer
+      init_args:
+        dim: 768
+        output_dim: 512
+        n_layers: 6
+        n_heads: 12
+        window_size: 65
+        use_rope: true
+        rope_theta: 10000.0
+        max_seq_len: 512
+        use_flash_attention: true
+
+    mel_decoder:
+      class_path: miocodec.module.transformer.Transformer
+      init_args:
+        dim: 512
+        output_dim: 128 # Number of mel frequency bins
+        n_layers: 6
+        n_heads: 8
+        window_size: 65
+        use_rope: true
+        rope_theta: 10000.0
+        max_seq_len: 512
+        adanorm_condition_dim: 128 # Must match global encoder output dimension
+        use_adaln_zero: true # Use AdaLNZero for conditioning
+        use_flash_attention: true
+
+    mel_postnet:
+      class_path: miocodec.module.postnet.PostNet
+      init_args:
+        input_channels: 128 # Number of mel frequency bins
+        channels: 256
+        kernel_size: 7
+        num_layers: 4
+        use_layer_norm: true

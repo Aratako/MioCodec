@@ -1,0 +1,35 @@
+[project]
+name = "miocodec"
+version = "0.1.0"
+description = "MioCodec inference package."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "huggingface_hub",
+  "jsonargparse[signatures]",
+  "numpy",
+  "json5",
+  "ruamel.yaml",
+  "einops",
+  "julius",
+  "safetensors",
+  "soundfile",
+  "torch",
+  "torchaudio",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.6,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
+torchaudio = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.ruff]
+line-length = 120

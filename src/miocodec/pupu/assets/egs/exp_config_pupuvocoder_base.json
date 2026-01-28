@@ -1,0 +1,72 @@
+{
+  "base_config": "config/afgen.json",
+  // TODO: Choose your needed datasets
+  "dataset": [
+    "train_example",
+  ],
+  "log_dir": "experiments/",
+  "preprocess": {
+    "f0_min": 32.70,
+    "f0_max": 1975.5,
+    "cut_mel_frame": 128,
+    "sample_rate": 44100
+  },
+  "model": {
+    "discriminators": [
+      "msd",
+      "mpd",
+      "mssbstftd",
+      "mssbcqtd",
+    ],
+    "mpd": {
+      "mpd_reshapes": [
+        2,
+        3,
+        5,
+        7,
+        11,
+        17,
+        23,
+        37
+      ],
+      "use_spectral_norm": false,
+      "discriminator_channel_mult_factor": 1
+    },
+    "msstftd": {
+        "filters": 32
+    },
+    "mssbcqtd": {
+      hop_lengths: [1024, 512, 512],
+      filters: 32,
+      max_filters: 1024,
+      filters_scale: 1,
+      dilations: [1, 2, 4],
+      in_channels: 1,
+      out_channels: 1,
+      n_octaves: [10, 10, 10],
+      bins_per_octaves: [24, 36, 48]
+    },
+  },
+  "train": {
+    // TODO: Choose a suitable batch size, training epoch, and save stride
+    "random_seed": 114514,
+    "freeze_step": 0,
+    "batch_size": 8,
+    "max_epoch": 1000000,
+    "save_checkpoint_stride": [1],
+    "adamw": {
+        "lr": 1.0e-4,
+        "adam_b1": 0.8,
+        "adam_b2": 0.99
+    },
+    "exponential_lr": {
+        "lr_decay": 0.9999996
+    },
+    "dataloader": {
+      "num_worker": 32,
+      "pin_memory": true,
+      "persistent_workers": true,
+      "prefetch_factor": 4
+    },
+  }
+}
