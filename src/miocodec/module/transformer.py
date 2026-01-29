@@ -25,7 +25,7 @@ def _warn_flash_cpu_once():
 
 
 try:
-    from flash_attn import flash_attn_func, flash_attn_with_kvcache
+    from flash_attn import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
 
     FLASH_ATTN_AVAILABLE = True
 except ImportError:
@@ -134,6 +134,9 @@ class Attention(nn.Module):
         freqs_cis: torch.Tensor | None,
         mask: torch.Tensor | None,
         return_kv: bool = False,
+        key_padding_mask: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: int | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """Forward pass for multi-head attention.
         Args:
@@ -141,6 +144,11 @@ class Attention(nn.Module):
             freqs_cis (torch.Tensor, optional): Precomputed rotary frequencies.
             mask (torch.Tensor, optional): Attention mask.
             return_kv (bool): Whether to return KV pairs for caching.
+            key_padding_mask (torch.Tensor, optional): Padding mask of shape (bsz, seqlen).
+                True indicates valid positions, False indicates padding positions.
+            cu_seqlens (torch.Tensor, optional): Cumulative sequence lengths for flash_attn_varlen_func.
+                Shape (bsz + 1,), used for variable-length flash attention.
+            max_seqlen (int, optional): Maximum sequence length in the batch. Required when cu_seqlens is provided.
         Returns:
             output (torch.Tensor): Output tensor of shape (bsz, seqlen, dim).
             new_kv (tuple, optional): KV pairs if return_kv is True.
@@ -160,23 +168,73 @@ class Attention(nn.Module):
         use_flash = self.use_flash_attention and FLASH_ATTN_AVAILABLE and x.is_cuda
         if self.use_flash_attention and FLASH_ATTN_AVAILABLE and not x.is_cuda:
             _warn_flash_cpu_once()
+
         if use_flash:
             assert mask is None, "Flash attention does not support arbitrary masking."
 
-            # Flash Attention
             window_size = (self.window_per_side, self.window_per_side) if self.use_local_attention else (-1, -1)
-            output = flash_attn_func(
-                xq,  # (bsz, seqlen, n_heads, head_dim)
-                xk,  # (bsz, seqlen, n_heads, head_dim)
-                xv,  # (bsz, seqlen, n_heads, head_dim)
-                dropout_p=(self.dropout if self.training else 0.0),
-                softmax_scale=self.scale,
-                window_size=window_size,
-                causal=self.causal,
-            )  # (bsz, seqlen, n_heads, head_dim)
+
+            # Use flash_attn_varlen_func for variable-length sequences with padding
+            if cu_seqlens is not None and max_seqlen is not None:
+                # Reshape to (total_tokens, n_heads, head_dim) for varlen function
+                # We need to pack the valid tokens only
+                if key_padding_mask is not None:
+                    # Pack valid tokens
+                    valid_mask = key_padding_mask.view(-1)  # (bsz * seqlen,)
+                    xq_packed = xq.view(-1, self.n_heads, self.head_dim)[valid_mask]
+                    xk_packed = xk.view(-1, self.n_heads, self.head_dim)[valid_mask]
+                    xv_packed = xv.view(-1, self.n_heads, self.head_dim)[valid_mask]
+                else:
+                    xq_packed = xq.view(-1, self.n_heads, self.head_dim)
+                    xk_packed = xk.view(-1, self.n_heads, self.head_dim)
+                    xv_packed = xv.view(-1, self.n_heads, self.head_dim)
+
+                output_packed = flash_attn_varlen_func(
+                    xq_packed,
+                    xk_packed,
+                    xv_packed,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen,
+                    dropout_p=(self.dropout if self.training else 0.0),
+                    softmax_scale=self.scale,
+                    causal=self.causal,
+                    window_size=window_size,
+                )
+
+                # Unpack back to (bsz, seqlen, n_heads, head_dim)
+                if key_padding_mask is not None:
+                    output = torch.zeros(bsz * seqlen, self.n_heads, self.head_dim,
+                                         device=x.device, dtype=output_packed.dtype)
+                    output[valid_mask] = output_packed
+                    output = output.view(bsz, seqlen, self.n_heads, self.head_dim)
+                else:
+                    output = output_packed.view(bsz, seqlen, self.n_heads, self.head_dim)
+            else:
+                # Standard flash attention without variable-length handling
+                output = flash_attn_func(
+                    xq,  # (bsz, seqlen, n_heads, head_dim)
+                    xk,  # (bsz, seqlen, n_heads, head_dim)
+                    xv,  # (bsz, seqlen, n_heads, head_dim)
+                    dropout_p=(self.dropout if self.training else 0.0),
+                    softmax_scale=self.scale,
+                    window_size=window_size,
+                    causal=self.causal,
+                )  # (bsz, seqlen, n_heads, head_dim)
 
         else:
             attn_mask = self.create_mask(bsz, seqlen, mask, x.device)
+
+            # Apply key_padding_mask to attention mask
+            if key_padding_mask is not None:
+                # key_padding_mask: (bsz, seqlen), True = valid, False = padding
+                # Create mask where padding positions cannot be attended to
+                padding_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)  # (bsz, 1, 1, seqlen)
+                if attn_mask is None:
+                    attn_mask = padding_mask.expand(-1, self.n_heads, seqlen, -1)
+                else:
+                    attn_mask = attn_mask & padding_mask
 
             # SDPA Attention
             output = F.scaled_dot_product_attention(
@@ -338,6 +396,9 @@ class TransformerBlock(nn.Module):
         return_kv: bool = False,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
         start_pos: int | None = None,
+        key_padding_mask: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: int | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """
         Forward pass for a single Transformer block.
@@ -349,6 +410,10 @@ class TransformerBlock(nn.Module):
             return_kv (bool): Whether to return KV pairs for caching.
             kv_cache (tuple, optional): KV cache for efficient inference.
             start_pos (int, optional): Starting position for KV cache.
+            key_padding_mask (torch.Tensor, optional): Padding mask of shape (bsz, seqlen).
+                True indicates valid positions, False indicates padding positions.
+            cu_seqlens (torch.Tensor, optional): Cumulative sequence lengths for flash_attn_varlen_func.
+            max_seqlen (int, optional): Maximum sequence length in the batch.
         Returns:
             out (torch.Tensor): Output tensor of shape (bsz, seqlen, dim).
             new_kv (tuple, optional): New KV pairs if return_kv is True or kv_cache is provided.
@@ -367,9 +432,13 @@ class TransformerBlock(nn.Module):
             attn_out, new_kv = self.attention.forward_with_cache(attn_normed, kv_cache, freqs_cis, start_pos)
         elif return_kv:
             # Return KV pairs for caching
-            attn_out, new_kv = self.attention(attn_normed, freqs_cis, mask, return_kv=True)
+            attn_out, new_kv = self.attention(attn_normed, freqs_cis, mask, return_kv=True,
+                                               key_padding_mask=key_padding_mask,
+                                               cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         else:
-            attn_out = self.attention(attn_normed, freqs_cis, mask)
+            attn_out = self.attention(attn_normed, freqs_cis, mask,
+                                       key_padding_mask=key_padding_mask,
+                                       cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
 
         # Apply gating for attention if using AdaLNZero
         if self.use_adaln_zero:
@@ -504,6 +573,7 @@ class Transformer(nn.Module):
         return_kv: bool = False,
         kv_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         start_pos: int | None = None,
+        key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
         """
         Forward pass for the Transformer model.
@@ -514,6 +584,9 @@ class Transformer(nn.Module):
             return_kv (bool): Whether to return KV pairs for caching.
             kv_cache (list, optional): List of KV caches for each layer for efficient inference.
             start_pos (int, optional): Starting position for KV cache.
+            key_padding_mask (torch.Tensor, optional): Padding mask of shape (bsz, seqlen).
+                True indicates valid positions, False indicates padding positions.
+                Used for batch processing with variable-length sequences.
         Returns:
             output (torch.Tensor): Output tensor of shape (bsz, seqlen, output_dim).
             new_kv_list (list, optional): List of new KV pairs for each layer if return_kv is True or kv_cache is provided.
@@ -538,6 +611,16 @@ class Transformer(nn.Module):
         else:
             freqs_cis = None
 
+        # Prepare cu_seqlens and max_seqlen for flash_attn_varlen_func if key_padding_mask is provided
+        cu_seqlens = None
+        max_seqlen = None
+        if key_padding_mask is not None and FLASH_ATTN_AVAILABLE and x.is_cuda:
+            # Calculate actual sequence lengths from padding mask
+            seq_lens = key_padding_mask.sum(dim=1).to(torch.int32)  # (bsz,)
+            cu_seqlens = torch.zeros(bsz + 1, dtype=torch.int32, device=x.device)
+            cu_seqlens[1:] = torch.cumsum(seq_lens, dim=0)
+            max_seqlen = seq_lens.max().item()
+
         x = self.input_proj(x)
         new_kv_list = []
         for i, layer in enumerate(self.layers):
@@ -546,10 +629,14 @@ class Transformer(nn.Module):
                 x, new_kv = layer(x, freqs_cis, mask, condition, kv_cache=kv_cache[i], start_pos=start_pos)
                 new_kv_list.append(new_kv)
             elif return_kv:
-                x, new_kv = layer(x, freqs_cis, mask, condition, return_kv=True)
+                x, new_kv = layer(x, freqs_cis, mask, condition, return_kv=True,
+                                  key_padding_mask=key_padding_mask,
+                                  cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
                 new_kv_list.append(new_kv)
             else:
-                x = layer(x, freqs_cis, mask, condition)
+                x = layer(x, freqs_cis, mask, condition,
+                          key_padding_mask=key_padding_mask,
+                          cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
 
         # Apply final normalization
         if self.use_adaln_zero:

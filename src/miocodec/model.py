@@ -482,6 +482,138 @@ class MioCodecModel(nn.Module):
         return mel_spectrogram.squeeze(0)  # (n_mels, T)
 
     @torch.inference_mode()
+    def decode_batch(
+        self,
+        global_embeddings: torch.Tensor,
+        content_token_indices: torch.Tensor | None = None,
+        content_embeddings: torch.Tensor | None = None,
+        content_lengths: torch.Tensor | list[int] | None = None,
+        target_audio_lengths: torch.Tensor | list[int] | None = None,
+        padding_token_idx: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Synthesize mel spectrograms from batched content and global features using MioCodec.
+
+        Supports variable-length sequences via padding. Each sample in the batch can have
+        different content lengths and target audio lengths.
+
+        Args:
+            global_embeddings (torch.Tensor): Global embedding tensor (B, dim).
+            content_token_indices (torch.Tensor, optional): Content token indices tensor (B, max_seq_len).
+                Padded with padding_token_idx for sequences shorter than max_seq_len.
+            content_embeddings (torch.Tensor, optional): Content embedding tensor (B, max_seq_len, dim).
+                If both content_token_indices and content_embeddings are provided, content_embeddings takes precedence.
+            content_lengths (torch.Tensor | list[int], optional): Actual content length for each sample (B,).
+                If None, assumes all samples have the same length (max_seq_len).
+            target_audio_lengths (torch.Tensor | list[int], optional): Target audio length for each sample (B,).
+                If None, uses the audio length estimated from content_lengths.
+            padding_token_idx (int): Token index used for padding in content_token_indices.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]:
+                - mel_spectrograms: Generated mel spectrogram tensor (B, n_mels, max_mel_len), padded to max length
+                - mel_lengths: Actual mel length for each sample (B,)
+        """
+        # Obtain content embeddings if not provided
+        if content_embeddings is None:
+            if content_token_indices is None:
+                raise ValueError("Either content_token_indices or content_embeddings must be provided.")
+            content_embeddings = self.decode_token_indices(content_token_indices)  # (B, max_seq_len, dim)
+
+        batch_size = content_embeddings.size(0)
+        max_seq_len = content_embeddings.size(1)
+        device = content_embeddings.device
+
+        # Handle content_lengths
+        if content_lengths is None:
+            content_lengths = torch.full((batch_size,), max_seq_len, dtype=torch.long, device=device)
+        elif isinstance(content_lengths, list):
+            content_lengths = torch.tensor(content_lengths, dtype=torch.long, device=device)
+        else:
+            content_lengths = content_lengths.to(device)
+
+        # Handle target_audio_lengths
+        if target_audio_lengths is None:
+            # Estimate from content lengths
+            target_audio_lengths = torch.tensor(
+                [self._calculate_original_audio_length(length.item()) for length in content_lengths],
+                dtype=torch.long,
+                device=device,
+            )
+        elif isinstance(target_audio_lengths, list):
+            target_audio_lengths = torch.tensor(target_audio_lengths, dtype=torch.long, device=device)
+        else:
+            target_audio_lengths = target_audio_lengths.to(device)
+
+        # Calculate mel lengths for each sample
+        mel_lengths = torch.tensor(
+            [self._calculate_target_mel_length(length.item()) for length in target_audio_lengths],
+            dtype=torch.long,
+            device=device,
+        )
+        max_mel_length = mel_lengths.max().item()
+
+        # Create padding mask for content embeddings (True = valid, False = padding)
+        content_padding_mask = torch.arange(max_seq_len, device=device).unsqueeze(0) < content_lengths.unsqueeze(1)
+
+        device_type = content_embeddings.device.type
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=True):
+            # Process through mel_prenet with padding mask
+            local_latent = self.mel_prenet(content_embeddings, key_padding_mask=content_padding_mask)
+
+            # Upsample with Conv1DTranspose if configured
+            if self.mel_conv_upsample is not None:
+                local_latent = self.mel_conv_upsample(local_latent.transpose(1, 2)).transpose(1, 2)
+
+            # Calculate the latent length after conv upsample (for padding mask update)
+            if self.mel_conv_upsample is not None:
+                upsampled_content_lengths = content_lengths * self.config.mel_upsample_factor
+            else:
+                upsampled_content_lengths = content_lengths
+
+            # Interpolate each sample to its target mel length, then pad to max_mel_length
+            # We need to process each sample separately for variable-length interpolation
+            mel_latents = []
+            for i in range(batch_size):
+                # Use only valid portion for interpolation
+                valid_len = upsampled_content_lengths[i].item()
+                sample_latent = local_latent[i : i + 1, :valid_len, :]  # (1, valid_len, C)
+                mel_len = mel_lengths[i].item()
+
+                # Interpolate to target mel length
+                sample_latent = F.interpolate(
+                    sample_latent.transpose(1, 2),  # (1, C, valid_len)
+                    size=mel_len,
+                    mode=self.config.mel_interpolation_mode,
+                ).transpose(1, 2)  # (1, mel_len, C)
+
+                # Pad to max_mel_length
+                if mel_len < max_mel_length:
+                    padding = torch.zeros(
+                        1, max_mel_length - mel_len, sample_latent.size(2),
+                        device=device, dtype=sample_latent.dtype
+                    )
+                    sample_latent = torch.cat([sample_latent, padding], dim=1)
+
+                mel_latents.append(sample_latent)
+
+            local_latent = torch.cat(mel_latents, dim=0)  # (B, max_mel_length, C)
+
+            # Create padding mask for mel decoder (True = valid, False = padding)
+            mel_padding_mask = torch.arange(max_mel_length, device=device).unsqueeze(0) < mel_lengths.unsqueeze(1)
+
+            # Generate mel spectrogram, conditioned on global embeddings
+            mel_recon = self.mel_decoder(
+                local_latent,
+                condition=global_embeddings.unsqueeze(1),
+                key_padding_mask=mel_padding_mask
+            )
+            mel_recon = mel_recon.transpose(1, 2)  # (B, n_mels, max_mel_length)
+
+            mel_recon = self.mel_postnet(mel_recon)
+
+        return mel_recon, mel_lengths
+
+    @torch.inference_mode()
     def voice_conversion(self, source_waveform: torch.Tensor, reference_waveform: torch.Tensor) -> torch.Tensor:
         """Convert voice using MioCodec, keeping content from source and global characteristics from reference.
         Only supports single audio input. Just a convenient wrapper around encode and decode methods.
