@@ -1,0 +1,108 @@
+model:
+  class_path: miocodec.model.MioCodecModel
+  init_args:
+    config:
+      # SSL Feature settings
+      local_ssl_layers: [6, 9]
+      global_ssl_layers: [1, 2]
+      normalize_ssl_features: true
+
+      # Down/up-sampling settings
+      downsample_factor: 2
+      use_conv_downsample: true
+
+      # Audio settings
+      sample_rate: 24000
+      n_fft: 1920
+      hop_length: 480
+
+      # Wave decoder settings
+      use_wave_decoder: true
+      wave_upsample_factor: 2
+      wave_interpolation_mode: linear
+      wave_decoder_dim: 512
+      wave_resnet_num_blocks: 2
+      wave_resnet_kernel_size: 3
+      wave_resnet_num_groups: 32
+      wave_resnet_dropout: 0.1
+      istft_padding: same
+
+    ssl_feature_extractor:
+      class_path: miocodec.module.ssl_extractor.SSLFeatureExtractor
+      init_args:
+        model_name: wavlm_base_plus
+        output_layer: 9
+        sample_rate: 24000
+
+    local_encoder:
+      class_path: miocodec.module.transformer.Transformer
+      init_args:
+        dim: 768
+        n_layers: 6
+        n_heads: 12
+        window_size: 125
+        use_rope: true
+        rope_theta: 10000.0
+        max_seq_len: 512
+        use_flash_attention: true
+
+    local_quantizer:
+      class_path: miocodec.module.fsq.FiniteScalarQuantizer
+      init_args:
+        input_dim: 768
+        output_dim: 768
+        levels: [8, 8, 8, 5, 5]  # 12800
+
+    feature_decoder:
+      class_path: miocodec.module.transformer.Transformer
+      init_args:
+        dim: 768
+        n_layers: 6
+        n_heads: 12
+        window_size: 125
+        use_rope: true
+        rope_theta: 10000.0
+        max_seq_len: 512
+        use_flash_attention: true
+
+    global_encoder:
+      class_path: miocodec.module.global_encoder.GlobalEncoder
+      init_args:
+        input_channels: 768
+        output_channels: 128
+        num_layers: 4
+        dim: 384
+        intermediate_dim: 1152
+
+    # Mel decoder not used
+    mel_prenet: null
+    mel_decoder: null
+    mel_postnet: null
+
+    # Wave decoder components
+    wave_prenet:
+      class_path: miocodec.module.transformer.Transformer
+      init_args:
+        dim: 768
+        output_dim: 512
+        n_layers: 6
+        n_heads: 12
+        window_size: 65
+        use_rope: true
+        rope_theta: 10000.0
+        max_seq_len: 512
+        use_flash_attention: true
+
+    wave_decoder:
+      class_path: miocodec.module.transformer.Transformer
+      init_args:
+        dim: 512
+        n_layers: 8
+        n_heads: 8
+        window_size: 65
+        use_rope: true
+        rope_theta: 10000.0
+        max_seq_len: 512
+        adanorm_condition_dim: 128
+        use_adaln_zero: true
+        use_flash_attention: true

@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from .module.fsq import FiniteScalarQuantizer
 from .module.global_encoder import GlobalEncoder
+from .module.istft_head import ISTFTHead, ResNetStack
 from .module.postnet import PostNet
 from .module.ssl_extractor import SSLFeatureExtractor
 from .module.transformer import Transformer
@@ -41,6 +42,17 @@ class MioCodecModelConfig:
     mel_fmax: float | None = None
     mel_win_length: int | None = None
 
+    # Wave decoder settings (direct waveform synthesis without mel intermediate)
+    use_wave_decoder: bool = False  # Whether to use direct wave decoder instead of mel decoder
+    wave_upsample_factor: int = 4  # Conv1DTranspose upsampling factor for wave decoder
+    wave_interpolation_mode: str = "linear"  # Interpolation mode for wave upsampling
+    wave_decoder_dim: int = 512  # Hidden dimension for wave decoder
+    wave_resnet_num_blocks: int = 2  # Number of ResNet blocks before/after transformer
+    wave_resnet_kernel_size: int = 3  # Kernel size for ResNet blocks
+    wave_resnet_num_groups: int = 32  # Number of groups for GroupNorm in ResNet
+    wave_resnet_dropout: float = 0.1  # Dropout for ResNet blocks
+    istft_padding: str = "same"  # Padding mode for ISTFT ("same" or "center")
+
 
 @dataclass
 class MioCodecFeatures:
@@ -60,16 +72,35 @@ class MioCodecModel(nn.Module):
         local_quantizer: FiniteScalarQuantizer,
         feature_decoder: Transformer | None,
         global_encoder: GlobalEncoder,
-        mel_prenet: Transformer,
-        mel_decoder: Transformer,
-        mel_postnet: PostNet,
+        mel_prenet: Transformer | None = None,
+        mel_decoder: Transformer | None = None,
+        mel_postnet: PostNet | None = None,
+        wave_prenet: Transformer | None = None,
+        wave_decoder: Transformer | None = None,
     ):
         super().__init__()
         self.config = config
         self._init_ssl_extractor(config, ssl_feature_extractor)
         self._init_local_branch(config, local_encoder, local_quantizer, feature_decoder)
         self._init_global_branch(global_encoder)
-        self._init_mel_decoder(config, mel_prenet, mel_decoder, mel_postnet)
+
+        # Initialize either mel decoder or wave decoder based on config
+        if config.use_wave_decoder:
+            self._init_wave_decoder(config, wave_prenet, wave_decoder)
+            # Set mel decoder components to None
+            self.mel_prenet = None
+            self.mel_decoder = None
+            self.mel_postnet = None
+            self.mel_conv_upsample = None
+        else:
+            self._init_mel_decoder(config, mel_prenet, mel_decoder, mel_postnet)
+            # Set wave decoder components to None
+            self.wave_prenet = None
+            self.wave_decoder = None
+            self.wave_prior_net = None
+            self.wave_post_net = None
+            self.wave_conv_upsample = None
+            self.istft_head = None
 
     def _init_ssl_extractor(self, config: MioCodecModelConfig, ssl_feature_extractor: SSLFeatureExtractor):
         """Initialize and configure SSL feature extractor."""
@@ -156,6 +187,62 @@ class MioCodecModel(nn.Module):
             )
             logger.debug(f"Using Conv1DTranspose for mel upsampling with factor {config.mel_upsample_factor}")
 
+    def _init_wave_decoder(
+        self, config: MioCodecModelConfig, wave_prenet: Transformer, wave_decoder: Transformer
+    ):
+        """Initialize wave decoder components for direct waveform synthesis.
+
+        Architecture:
+            content_tokens -> wave_prenet -> conv_upsample -> interpolate
+            -> wave_prior_net (ResNet) -> wave_decoder (Transformer with AdaLN-Zero)
+            -> wave_post_net (ResNet) -> istft_head -> waveform
+        """
+        self.wave_prenet = wave_prenet
+        self.wave_decoder = wave_decoder
+
+        wave_dim = config.wave_decoder_dim
+
+        # Configure wave upsampling
+        self.wave_conv_upsample = None
+        if config.wave_upsample_factor > 1:
+            input_dim = wave_prenet.output_dim
+            self.wave_conv_upsample = nn.ConvTranspose1d(
+                input_dim, input_dim, kernel_size=config.wave_upsample_factor, stride=config.wave_upsample_factor
+            )
+            logger.debug(f"Using Conv1DTranspose for wave upsampling with factor {config.wave_upsample_factor}")
+
+        # ResNet blocks before transformer (prior_net)
+        self.wave_prior_net = ResNetStack(
+            channels=wave_dim,
+            num_blocks=config.wave_resnet_num_blocks,
+            kernel_size=config.wave_resnet_kernel_size,
+            num_groups=config.wave_resnet_num_groups,
+            dropout=config.wave_resnet_dropout,
+        )
+        logger.debug(f"Wave prior_net: {config.wave_resnet_num_blocks} ResNet blocks")
+
+        # ResNet blocks after transformer (post_net)
+        self.wave_post_net = ResNetStack(
+            channels=wave_dim,
+            num_blocks=config.wave_resnet_num_blocks,
+            kernel_size=config.wave_resnet_kernel_size,
+            num_groups=config.wave_resnet_num_groups,
+            dropout=config.wave_resnet_dropout,
+        )
+        logger.debug(f"Wave post_net: {config.wave_resnet_num_blocks} ResNet blocks")
+
+        # ISTFT head for waveform synthesis
+        self.istft_head = ISTFTHead(
+            dim=wave_dim,
+            n_fft=config.n_fft,
+            hop_length=config.hop_length,
+            padding=config.istft_padding,
+        )
+        logger.debug(
+            f"ISTFTHead initialized: dim={wave_dim}, n_fft={config.n_fft}, "
+            f"hop_length={config.hop_length}, padding={config.istft_padding}"
+        )
+
     def _calculate_waveform_padding(self, audio_length: int, ensure_recon_length: bool = False) -> int:
         """Calculate required padding for input waveform to ensure consistent SSL feature lengths."""
         extractor = self.ssl_feature_extractor
@@ -197,6 +284,13 @@ class MioCodecModel(nn.Module):
         else:
             return (audio_length - self.config.n_fft) // self.config.hop_length + 1
 
+    def _calculate_target_stft_length(self, audio_length: int) -> int:
+        """Calculate the target STFT frame length based on audio length for wave decoder."""
+        if self.config.istft_padding == "same":
+            return audio_length // self.config.hop_length
+        else:  # center
+            return audio_length // self.config.hop_length + 1
+
     def _process_ssl_features(self, features: list[torch.Tensor], layers: list[int]) -> torch.Tensor:
         if len(layers) > 1:
             # Get features from multiple layers and average them
@@ -233,7 +327,7 @@ class MioCodecModel(nn.Module):
             waveform = waveform.squeeze(1)
 
         # 1. Extract SSL features
-        if padding > 0:
+        if padding and padding > 0:
             waveform = F.pad(waveform, (padding, padding), mode="constant")
 
         with torch.no_grad():
@@ -336,6 +430,50 @@ class MioCodecModel(nn.Module):
 
         mel_recon = self.mel_postnet(mel_recon)
         return mel_recon
+
+    def forward_wave(
+        self, content_embeddings: torch.Tensor, global_embeddings: torch.Tensor, stft_length: int
+    ) -> torch.Tensor:
+        """Forward pass to generate waveform directly from content and global embeddings.
+
+        This method bypasses mel spectrogram prediction and directly generates waveform
+        using ISTFT-based synthesis.
+
+        Args:
+            content_embeddings: Content embeddings tensor of shape (B, T, C)
+            global_embeddings: Global embeddings tensor of shape (B, C)
+            stft_length: Target STFT frame length (T_stft)
+        Returns:
+            waveform: Reconstructed waveform tensor of shape (B, samples)
+        """
+        # Prenet transformation
+        local_latent = self.wave_prenet(content_embeddings)
+
+        # Upsample to match STFT frame rate
+        # First use Conv1DTranspose if configured
+        if self.wave_conv_upsample is not None:
+            # (B, T, C) -> (B, C, T) -> conv -> (B, C, T*factor) -> (B, T*factor, C)
+            local_latent = self.wave_conv_upsample(local_latent.transpose(1, 2)).transpose(1, 2)
+
+        # Interpolate to exact STFT length
+        local_latent = F.interpolate(
+            local_latent.transpose(1, 2), size=stft_length, mode=self.config.wave_interpolation_mode
+        ).transpose(1, 2)  # (B, T_stft, C)
+
+        # Prior ResNet blocks (local pattern processing)
+        # ResNet expects (B, C, T), so transpose
+        local_latent = self.wave_prior_net(local_latent.transpose(1, 2)).transpose(1, 2)
+
+        # Transformer decoder with speaker conditioning via AdaLN-Zero
+        local_latent = self.wave_decoder(local_latent, condition=global_embeddings.unsqueeze(1))
+
+        # Post ResNet blocks
+        local_latent = self.wave_post_net(local_latent.transpose(1, 2)).transpose(1, 2)
+
+        # ISTFT head: predict magnitude + phase and synthesize waveform
+        waveform = self.istft_head(local_latent)  # (B, samples)
+
+        return waveform
 
     # ======== Inference methods ========
 
@@ -450,7 +588,11 @@ class MioCodecModel(nn.Module):
         content_embedding: torch.Tensor | None = None,
         target_audio_length: int | None = None,
     ) -> torch.Tensor:
-        """Synthesize mel spectrograms from content and global features using MioCodec.
+        """Synthesize audio from content and global features using MioCodec.
+
+        If use_wave_decoder is True, returns waveform directly.
+        Otherwise, returns mel spectrogram (requires external vocoder for waveform synthesis).
+
         Args:
             global_embedding (torch.Tensor): Global embedding tensor (dim,).
             content_token_indices (torch.Tensor, optional): Optional content token indices tensor (seq_len).
@@ -459,7 +601,8 @@ class MioCodecModel(nn.Module):
             target_audio_length (int, optional): Target length of the output audio in samples.
                 If None, uses the original audio length estimated from the sequence length of content tokens.
         Returns:
-            torch.Tensor: Generated mel spectrogram tensor (n_mels, T).
+            torch.Tensor: If use_wave_decoder=True, returns waveform tensor (samples,).
+                          Otherwise, returns mel spectrogram tensor (n_mels, T).
         """
         # Obtain content embedding if not provided
         if content_embedding is None:
@@ -474,12 +617,19 @@ class MioCodecModel(nn.Module):
 
         device_type = content_embedding.device.type
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=True):
-            mel_length = self._calculate_target_mel_length(target_audio_length)
             content_embedding = content_embedding.unsqueeze(0)  # (1, seq_len, dim)
             global_embedding = global_embedding.unsqueeze(0)  # (1, dim)
-            mel_spectrogram = self.forward_mel(content_embedding, global_embedding, mel_length=mel_length)
 
-        return mel_spectrogram.squeeze(0)  # (n_mels, T)
+            if self.config.use_wave_decoder:
+                # Direct waveform synthesis
+                stft_length = self._calculate_target_stft_length(target_audio_length)
+                waveform = self.forward_wave(content_embedding, global_embedding, stft_length=stft_length)
+                return waveform.squeeze(0)  # (samples,)
+            else:
+                # Mel spectrogram synthesis (requires external vocoder)
+                mel_length = self._calculate_target_mel_length(target_audio_length)
+                mel_spectrogram = self.forward_mel(content_embedding, global_embedding, mel_length=mel_length)
+                return mel_spectrogram.squeeze(0)  # (n_mels, T)
 
     @torch.inference_mode()
     def decode_batch(
@@ -491,7 +641,10 @@ class MioCodecModel(nn.Module):
         target_audio_lengths: torch.Tensor | list[int] | None = None,
         padding_token_idx: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Synthesize mel spectrograms from batched content and global features using MioCodec.
+        """Synthesize audio from batched content and global features using MioCodec.
+
+        If use_wave_decoder is True, returns waveforms directly.
+        Otherwise, returns mel spectrograms (requires external vocoder for waveform synthesis).
 
         Supports variable-length sequences via padding. Each sample in the batch can have
         different content lengths and target audio lengths.
@@ -510,8 +663,12 @@ class MioCodecModel(nn.Module):
 
         Returns:
             tuple[torch.Tensor, torch.Tensor]:
-                - mel_spectrograms: Generated mel spectrogram tensor (B, n_mels, max_mel_len), padded to max length
-                - mel_lengths: Actual mel length for each sample (B,)
+                If use_wave_decoder=True:
+                    - waveforms: Generated waveform tensor (B, max_samples), padded to max length
+                    - audio_lengths: Actual audio length for each sample (B,)
+                Otherwise:
+                    - mel_spectrograms: Generated mel spectrogram tensor (B, n_mels, max_mel_len), padded to max length
+                    - mel_lengths: Actual mel length for each sample (B,)
         """
         # Obtain content embeddings if not provided
         if content_embeddings is None:
@@ -543,6 +700,29 @@ class MioCodecModel(nn.Module):
             target_audio_lengths = torch.tensor(target_audio_lengths, dtype=torch.long, device=device)
         else:
             target_audio_lengths = target_audio_lengths.to(device)
+
+        if self.config.use_wave_decoder:
+            # Wave decoder path: generate waveforms directly
+            return self._decode_batch_wave(
+                content_embeddings, global_embeddings, content_lengths, target_audio_lengths
+            )
+        else:
+            # Mel decoder path: generate mel spectrograms
+            return self._decode_batch_mel(
+                content_embeddings, global_embeddings, content_lengths, target_audio_lengths, device
+            )
+
+    def _decode_batch_mel(
+        self,
+        content_embeddings: torch.Tensor,
+        global_embeddings: torch.Tensor,
+        content_lengths: torch.Tensor,
+        target_audio_lengths: torch.Tensor,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Internal method for batch mel spectrogram synthesis."""
+        batch_size = content_embeddings.size(0)
+        max_seq_len = content_embeddings.size(1)
 
         # Calculate mel lengths for each sample
         mel_lengths = torch.tensor(
@@ -613,24 +793,78 @@ class MioCodecModel(nn.Module):
 
         return mel_recon, mel_lengths
 
+    def _decode_batch_wave(
+        self,
+        content_embeddings: torch.Tensor,
+        global_embeddings: torch.Tensor,
+        content_lengths: torch.Tensor,
+        target_audio_lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Internal method for batch waveform synthesis.
+
+        Processes each sample individually to ensure identical results to single-sample decode.
+        """
+        batch_size = content_embeddings.size(0)
+        max_audio_length = target_audio_lengths.max().item()
+
+        device_type = content_embeddings.device.type
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=True):
+            waveforms = []
+            for i in range(batch_size):
+                # Extract valid portion of content embedding for this sample
+                valid_len = content_lengths[i].item()
+                sample_content = content_embeddings[i : i + 1, :valid_len, :]  # (1, valid_len, C)
+                sample_global = global_embeddings[i : i + 1, :]  # (1, dim)
+                target_audio_len = target_audio_lengths[i].item()
+
+                # Calculate target STFT length (same as single decode)
+                stft_length = self._calculate_target_stft_length(target_audio_len)
+
+                # Generate waveform using forward_wave (identical to single decode path)
+                waveform = self.forward_wave(sample_content, sample_global, stft_length=stft_length)  # (1, samples)
+                waveform = waveform.squeeze(0)  # (samples,)
+
+                # Pad or trim to target audio length
+                current_len = waveform.size(0)
+                if current_len > target_audio_len:
+                    waveform = waveform[:target_audio_len]
+                elif current_len < target_audio_len:
+                    pad_size = target_audio_len - current_len
+                    waveform = F.pad(waveform, (0, pad_size), mode="constant", value=0.0)
+
+                # Pad to max_audio_length for batching
+                if target_audio_len < max_audio_length:
+                    pad_size = max_audio_length - target_audio_len
+                    waveform = F.pad(waveform, (0, pad_size), mode="constant", value=0.0)
+
+                waveforms.append(waveform.unsqueeze(0))
+
+            waveforms = torch.cat(waveforms, dim=0)  # (B, max_audio_length)
+
+        return waveforms, target_audio_lengths
+
     @torch.inference_mode()
     def voice_conversion(self, source_waveform: torch.Tensor, reference_waveform: torch.Tensor) -> torch.Tensor:
         """Convert voice using MioCodec, keeping content from source and global characteristics from reference.
-        Only supports single audio input. Just a convenient wrapper around encode and decode methods.
+
+        If use_wave_decoder is True, returns waveform directly.
+        Otherwise, returns mel spectrogram (requires external vocoder for waveform synthesis).
+
         Args:
             source_waveform (torch.Tensor): Source audio waveform tensor (samples,).
             reference_waveform (torch.Tensor): Reference audio waveform tensor (samples_ref,).
         Returns:
-            torch.Tensor: Converted mel spectrogram tensor (n_mels, T).
+            torch.Tensor: If use_wave_decoder=True, returns waveform tensor (samples,).
+                          Otherwise, returns mel spectrogram tensor (n_mels, T).
         """
         # Extract source content features and reference global features
         source_features = self.encode(source_waveform, return_content=True, return_global=False)
         reference_features = self.encode(reference_waveform, return_content=False, return_global=True)
 
-        # Synthesize mel spectrogram using source content and reference global features
-        mel_spectrogram = self.decode(
+        # Synthesize using source content and reference global features
+        output = self.decode(
             content_embedding=source_features.content_embedding,
             global_embedding=reference_features.global_embedding,
             target_audio_length=source_waveform.size(0),
         )
-        return mel_spectrogram
+        return output

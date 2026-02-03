@@ -1,17 +1,22 @@
-# MioCodec: High-Fidelity 44.1kHz Neural Audio Codec for Efficient Spoken Language Modeling
+# MioCodec: High-Fidelity Neural Audio Codec for Efficient Spoken Language Modeling
 
-[![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Model-MioCodec--25Hz-yellow)](https://huggingface.co/Aratako/MioCodec-25Hz)
+[![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Model-MioCodec--25Hz--24kHz-yellow)](https://huggingface.co/Aratako/MioCodec-25Hz-24kHz)
+[![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Model-MioCodec--25Hz--44.1kHz-blue)](https://huggingface.co/Aratako/MioCodec-25Hz-44.1kHz)
 
-MioCodec is a high-fidelity 44.1 kHz neural audio codec for efficient spoken language modeling.
+MioCodec is a high-fidelity neural audio codec for efficient spoken language modeling. Two variants are available:
+
+- **MioCodec-25Hz-24kHz**: Lightweight and fast model with integrated wave decoder
+- **MioCodec-25Hz-44.1kHz**: High-quality model at 44.1 kHz sample rate for maximum audio fidelity
 
 ## Model Comparison
 
-| Model | Token Rate | Vocab Size | Bit Rate | Sample Rate | SSL Encoder | Vocoder | Parameters |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| MioCodec-25Hz | 25 Hz | 12,800 | 341 bps | 44.1 kHz | WavLM-base+ | MioVocoder | 118M |
-| kanade-12.5hz | 12.5 Hz | 12,800 | 171 bps | 24 kHz | WavLM-base+ | Vocos 24kHz | 120M |
-| kanade-25hz | 25 Hz | 12,800 | 341 bps | 24 kHz | WavLM-base+ | Vocos 24kHz | 118M |
-| kanade-25hz-clean | 25 Hz | 12,800 | 341 bps | 24 kHz | WavLM-base+ | HiFT 24kHz | 142M |
+| Model | Token Rate | Vocab Size | Bit Rate | Sample Rate | SSL Encoder | Vocoder | Parameters | Highlights |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **MioCodec-25Hz-24kHz** | 25 Hz | 12,800 | 341 bps | 24 kHz | WavLM-base+ | - (iSTFTHead) | 132M | Lightweight, fast inference |
+| **MioCodec-25Hz-44.1kHz** | 25 Hz | 12,800 | 341 bps | 44.1 kHz | WavLM-base+ | MioVocoder | 118M (w/o vocoder) | High-quality, high sample rate |
+| kanade-12.5hz | 12.5 Hz | 12,800 | 171 bps | 24 kHz | WavLM-base+ | Vocos 24kHz | 120M (w/o vocoder) | Original 12.5Hz model |
+| kanade-25hz | 25 Hz | 12,800 | 341 bps | 24 kHz | WavLM-base+ | Vocos 24kHz | 118M (w/o vocoder) | Original 25Hz model |
+| kanade-25hz-clean | 25 Hz | 12,800 | 341 bps | 24 kHz | WavLM-base+ | HiFT 24kHz | 142M (w/o vocoder) | Original 25Hz clean model |
 
 ## Repository Structure
 
@@ -61,14 +66,44 @@ Ensure `ninja` is installed on your system, or the build will be very slow.
 
 ### Inference
 
-Basic usage for encoding and decoding audio:
+#### MioCodec-25Hz-24kHz (Recommended for most use cases)
+
+The 24kHz version uses an integrated wave decoder (iSTFT-based) for direct waveform synthesis without requiring an external vocoder. This makes it lightweight and fast.
+
+```python
+from miocodec import MioCodecModel, load_audio
+import soundfile as sf
+
+# Load model from Hugging Face
+model = MioCodecModel.from_pretrained("Aratako/MioCodec-25Hz-24kHz")
+model = model.eval().cuda()
+
+# Load audio
+waveform = load_audio("path/to/audio.wav", sample_rate=model.config.sample_rate).cuda()
+
+# Encode
+features = model.encode(waveform)
+
+# Decode to waveform (directly, no vocoder needed)
+resynth = model.decode(
+    content_token_indices=features.content_token_indices,
+    global_embedding=features.global_embedding,
+)
+
+# Save
+sf.write("resynth.wav", resynth.cpu().numpy(), model.config.sample_rate)
+```
+
+#### MioCodec-25Hz-44.1kHz (High-quality variant)
+
+The 44.1kHz version provides maximum audio fidelity with a higher sample rate. It uses an external vocoder (MioVocoder) for waveform synthesis.
 
 ```python
 from miocodec import MioCodec, load_audio
 import soundfile as sf
 
 # Load model from Hugging Face
-model = MioCodec.from_pretrained("Aratako/MioCodec-25Hz")
+model = MioCodec.from_pretrained("Aratako/MioCodec-25Hz-44.1kHz")
 model = model.eval().cuda()
 
 # Load audio
@@ -108,6 +143,11 @@ Thanks to the following projects and repositories:
 
 - Codec architecture and implementation are based on [kanade-tokenizer](https://github.com/frothywater/kanade-tokenizer).
 - Original vocoder weights and codebase are based on [AliasingFreeNeuralAudioSynthesis](https://github.com/sizigi/AliasingFreeNeuralAudioSynthesis).
+- Decoder design for the 24kHz version is inspired by [XCodec2](https://github.com/zhenye234/X-Codec-2.0).
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
 
 ## Citation
 
