@@ -1,4 +1,5 @@
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import jsonargparse
@@ -15,6 +16,17 @@ from .module.transformer import Transformer
 from .util import freeze_modules, get_logger
 
 logger = get_logger()
+
+
+def _get_autocast_context(device_type: str):
+    """Get autocast context for the given device type.
+
+    bfloat16 autocast is only enabled for CUDA devices because
+    torch.complex does not support bfloat16 on CPU/MPS.
+    """
+    if device_type == "cuda":
+        return torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=True)
+    return nullcontext()
 
 
 @dataclass
@@ -563,7 +575,7 @@ class MioCodecModel(nn.Module):
 
         result = MioCodecFeatures()
         device_type = local_ssl_features.device.type
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=True):
+        with _get_autocast_context(device_type):
             if return_content:
                 content_embedding, token_indices, _, _ = self.forward_content(local_ssl_features)
                 result.content_embedding = content_embedding.squeeze(0)  # (seq_len, dim)
@@ -616,7 +628,7 @@ class MioCodecModel(nn.Module):
             target_audio_length = self._calculate_original_audio_length(seq_len)
 
         device_type = content_embedding.device.type
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=True):
+        with _get_autocast_context(device_type):
             content_embedding = content_embedding.unsqueeze(0)  # (1, seq_len, dim)
             global_embedding = global_embedding.unsqueeze(0)  # (1, dim)
 
@@ -736,7 +748,7 @@ class MioCodecModel(nn.Module):
         content_padding_mask = torch.arange(max_seq_len, device=device).unsqueeze(0) < content_lengths.unsqueeze(1)
 
         device_type = content_embeddings.device.type
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=True):
+        with _get_autocast_context(device_type):
             # Process through mel_prenet with padding mask
             local_latent = self.mel_prenet(content_embeddings, key_padding_mask=content_padding_mask)
 
@@ -808,7 +820,7 @@ class MioCodecModel(nn.Module):
         max_audio_length = target_audio_lengths.max().item()
 
         device_type = content_embeddings.device.type
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=True):
+        with _get_autocast_context(device_type):
             waveforms = []
             for i in range(batch_size):
                 # Extract valid portion of content embedding for this sample
