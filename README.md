@@ -1,17 +1,20 @@
 # MioCodec: High-Fidelity Neural Audio Codec for Efficient Spoken Language Modeling
 
+[![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Model-MioCodec--25Hz--44.1kHz--v2-green)](https://huggingface.co/Aratako/MioCodec-25Hz-44.1kHz-v2)
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Model-MioCodec--25Hz--24kHz-yellow)](https://huggingface.co/Aratako/MioCodec-25Hz-24kHz)
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Model-MioCodec--25Hz--44.1kHz-blue)](https://huggingface.co/Aratako/MioCodec-25Hz-44.1kHz)
 
-MioCodec is a high-fidelity neural audio codec for efficient spoken language modeling. Two variants are available:
+MioCodec is a high-fidelity neural audio codec for efficient spoken language modeling. Multiple variants are available:
 
-- **MioCodec-25Hz-24kHz**: Lightweight and fast model with integrated wave decoder
-- **MioCodec-25Hz-44.1kHz**: High-quality model at 44.1 kHz sample rate for maximum audio fidelity
+- **MioCodec-25Hz-44.1kHz-v2** (Recommended): High-quality 44.1 kHz model with integrated wave decoder
+- **MioCodec-25Hz-24kHz**: Lightweight 24 kHz model with integrated wave decoder
+- **MioCodec-25Hz-44.1kHz**: Legacy 44.1 kHz model using external vocoder (MioVocoder)
 
 ## Model Comparison
 
 | Model | Token Rate | Vocab Size | Bit Rate | Sample Rate | SSL Encoder | Vocoder | Parameters | Highlights |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
+| **MioCodec-25Hz-44.1kHz-v2** | 25 Hz | 12,800 | 341 bps | 44.1 kHz | WavLM-base+ | - (iSTFTHead) | 133M | Fast inference, good quality |
 | **MioCodec-25Hz-24kHz** | 25 Hz | 12,800 | 341 bps | 24 kHz | WavLM-base+ | - (iSTFTHead) | 132M | Lightweight, fast inference |
 | **MioCodec-25Hz-44.1kHz** | 25 Hz | 12,800 | 341 bps | 44.1 kHz | WavLM-base+ | MioVocoder | 118M (w/o vocoder) | High-quality, high sample rate |
 | kanade-12.5hz | 12.5 Hz | 12,800 | 171 bps | 24 kHz | WavLM-base+ | Vocos 24kHz | 120M (w/o vocoder) | Original 12.5Hz model |
@@ -66,16 +69,17 @@ Ensure `ninja` is installed on your system, or the build will be very slow.
 
 ### Inference
 
-#### MioCodec-25Hz-24kHz (Recommended for most use cases)
+#### MioCodec-25Hz-44.1kHz-v2 / MioCodec-25Hz-24kHz (Recommended)
 
-The 24kHz version uses an integrated wave decoder (iSTFT-based) for direct waveform synthesis without requiring an external vocoder. This makes it lightweight and fast.
+These models use an integrated wave decoder (iSTFT-based) for direct waveform synthesis without requiring an external vocoder. This makes them lightweight and fast.
 
 ```python
 from miocodec import MioCodecModel, load_audio
 import soundfile as sf
 
 # Load model from Hugging Face
-model = MioCodecModel.from_pretrained("Aratako/MioCodec-25Hz-24kHz")
+# Use "Aratako/MioCodec-25Hz-44.1kHz-v2" for 44.1kHz or "Aratako/MioCodec-25Hz-24kHz" for 24kHz
+model = MioCodecModel.from_pretrained("Aratako/MioCodec-25Hz-44.1kHz-v2")
 model = model.eval().cuda()
 
 # Load audio
@@ -94,9 +98,9 @@ resynth = model.decode(
 sf.write("resynth.wav", resynth.cpu().numpy(), model.config.sample_rate)
 ```
 
-#### MioCodec-25Hz-44.1kHz (High-quality variant)
+#### MioCodec-25Hz-44.1kHz (Legacy)
 
-The 44.1kHz version provides maximum audio fidelity with a higher sample rate. It uses an external vocoder (MioVocoder) for waveform synthesis.
+The legacy 44.1kHz version uses an external vocoder (MioVocoder) for waveform synthesis.
 
 ```python
 from miocodec import MioCodec, load_audio
@@ -143,7 +147,7 @@ Thanks to the following projects and repositories:
 
 - Codec architecture and implementation are based on [kanade-tokenizer](https://github.com/frothywater/kanade-tokenizer).
 - Original vocoder weights and codebase are based on [AliasingFreeNeuralAudioSynthesis](https://github.com/sizigi/AliasingFreeNeuralAudioSynthesis).
-- Decoder design for the 24kHz version is inspired by [XCodec2](https://github.com/zhenye234/X-Codec-2.0).
+- Decoder design for the 24kHz and 44.1kHz-v2 versions is inspired by [XCodec2](https://github.com/zhenye234/X-Codec-2.0).
 
 ## License
 
