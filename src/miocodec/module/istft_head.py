@@ -6,6 +6,59 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class SnakeBeta(nn.Module):
+    """
+    Snake activation with separate learnable parameters for frequency (alpha) and magnitude (beta).
+
+    SnakeBeta(x) = x + (1/β) * sin²(αx)
+
+    This periodic activation function is well-suited for audio synthesis as it can learn
+    to generate periodic patterns at different frequencies and magnitudes.
+
+    Adapted from X-Codec-2.0, originally from https://arxiv.org/abs/2006.08195
+
+    Args:
+        channels: Number of input channels.
+        alpha_logscale: If True, alpha and beta are stored in log scale for more stable training.
+    """
+
+    def __init__(self, channels: int, alpha_logscale: bool = True):
+        super().__init__()
+        self.channels = channels
+        self.alpha_logscale = alpha_logscale
+
+        # Initialize alpha (frequency) and beta (magnitude)
+        if alpha_logscale:
+            # Log scale: initialized to zeros (exp(0) = 1)
+            self.alpha = nn.Parameter(torch.zeros(channels))
+            self.beta = nn.Parameter(torch.zeros(channels))
+        else:
+            # Linear scale: initialized to ones
+            self.alpha = nn.Parameter(torch.ones(channels))
+            self.beta = nn.Parameter(torch.ones(channels))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+
+        Args:
+            x: Input tensor of shape (B, C, T) where C is channels.
+
+        Returns:
+            Activated tensor of the same shape.
+        """
+        # Reshape for broadcasting: (C,) -> (1, C, 1)
+        alpha = self.alpha.unsqueeze(0).unsqueeze(-1)
+        beta = self.beta.unsqueeze(0).unsqueeze(-1)
+
+        if self.alpha_logscale:
+            alpha = torch.exp(alpha)
+            beta = torch.exp(beta)
+
+        # SnakeBeta: x + (1/β) * sin²(αx)
+        return x + (1.0 / (beta + 1e-9)) * torch.sin(alpha * x).pow(2)
+
+
 class ISTFT(nn.Module):
     """
     Custom implementation of ISTFT with "same" padding support.
@@ -230,3 +283,92 @@ class ResNetStack(nn.Module):
         for block in self.blocks:
             x = block(x)
         return x
+
+
+class UpSamplerBlock(nn.Module):
+    """
+    Upsampler block using transposed convolutions, SnakeBeta activations, and ResNet blocks.
+
+    This module upsamples feature embeddings in the time dimension using a series of
+    ConvTranspose1d layers, each followed by SnakeBeta activation and a ResNet block.
+    Adapted from X-Codec-2.0.
+
+    The upsampling is used to increase the frame rate before ISTFT, enabling
+    higher sample rate output (e.g., 44.1kHz) from lower frame rate features.
+
+    Args:
+        in_channels: Number of input channels.
+        upsample_factors: List of upsampling factors for each stage.
+            Total upsampling = product of all factors (e.g., [3, 3] -> 9x).
+        kernel_sizes: List of kernel sizes for each ConvTranspose1d.
+            If None, defaults to factor * 2 for each stage.
+        num_groups: Number of groups for GroupNorm in ResNet blocks.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        upsample_factors: list[int],
+        kernel_sizes: list[int] | None = None,
+        num_groups: int = 32,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.upsample_factors = list(upsample_factors)
+        self.kernel_sizes = list(kernel_sizes or [f * 2 for f in self.upsample_factors])
+
+        if len(self.kernel_sizes) != len(self.upsample_factors):
+            raise ValueError("kernel_sizes and upsample_factors must have the same length")
+
+        self.upsample_layers = nn.ModuleList()
+        self.snake_activations = nn.ModuleList()
+        self.resnet_blocks = nn.ModuleList()
+
+        # Final projection and activation
+        final_channels = self.in_channels // (2 ** len(self.upsample_factors))
+        self.out_proj = nn.Linear(final_channels, self.in_channels, bias=True)
+        self.out_snake = SnakeBeta(self.in_channels, alpha_logscale=True)
+
+        for i, (k, u) in enumerate(zip(self.kernel_sizes, self.upsample_factors)):
+            c_in = self.in_channels // (2**i)
+            c_out = self.in_channels // (2 ** (i + 1))
+            # ConvTranspose1d for upsampling
+            self.upsample_layers.append(
+                nn.utils.parametrizations.weight_norm(
+                    nn.ConvTranspose1d(c_in, c_out, kernel_size=k, stride=u, padding=(k - u) // 2)
+                )
+            )
+            # SnakeBeta activation after ConvTranspose
+            self.snake_activations.append(SnakeBeta(c_out, alpha_logscale=True))
+            # Adjust num_groups if c_out is smaller
+            effective_groups = min(num_groups, c_out)
+            self.resnet_blocks.append(
+                ResNetBlock(channels=c_out, num_groups=effective_groups, dropout=0.0)
+            )
+
+    @property
+    def total_upsample_factor(self) -> int:
+        """Total upsampling factor (product of all stage factors)."""
+        result = 1
+        for f in self.upsample_factors:
+            result *= f
+        return result
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the UpSamplerBlock.
+
+        Args:
+            x: Input tensor of shape (B, C, L) where C is in_channels and L is sequence length.
+
+        Returns:
+            Output tensor of shape (B, L', C) where L' = L * total_upsample_factor.
+            Note: Output is transposed to (B, L', C) for compatibility with ISTFTHead.
+        """
+        for up, snake, resblk in zip(self.upsample_layers, self.snake_activations, self.resnet_blocks):
+            x = snake(up(x))  # ConvTranspose -> SnakeBeta
+            x = resblk(x)     # ResNet block
+        # Project back to original channel dimension, apply SnakeBeta, and transpose to (B, L', C)
+        x = self.out_proj(x.transpose(1, 2))  # (B, L', C)
+        x = self.out_snake(x.transpose(1, 2))  # (B, C, L') -> SnakeBeta -> (B, C, L')
+        return x.transpose(1, 2)  # (B, L', C)

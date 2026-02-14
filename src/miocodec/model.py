@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from .module.fsq import FiniteScalarQuantizer
 from .module.global_encoder import GlobalEncoder
-from .module.istft_head import ISTFTHead, ResNetStack
+from .module.istft_head import ISTFTHead, ResNetStack, UpSamplerBlock
 from .module.postnet import PostNet
 from .module.ssl_extractor import SSLFeatureExtractor
 from .module.transformer import Transformer
@@ -64,6 +64,8 @@ class MioCodecModelConfig:
     wave_resnet_num_groups: int = 32  # Number of groups for GroupNorm in ResNet
     wave_resnet_dropout: float = 0.1  # Dropout for ResNet blocks
     istft_padding: str = "same"  # Padding mode for ISTFT ("same" or "center")
+    wave_upsampler_factors: tuple[int, ...] | None = None  # e.g., (3, 3) for 9x upsampling for 44.1kHz
+    wave_upsampler_kernel_sizes: tuple[int, ...] | None = None  # Kernel sizes for each upsampler stage
 
 
 @dataclass
@@ -112,6 +114,7 @@ class MioCodecModel(nn.Module):
             self.wave_prior_net = None
             self.wave_post_net = None
             self.wave_conv_upsample = None
+            self.wave_upsampler = None
             self.istft_head = None
 
     def _init_ssl_extractor(self, config: MioCodecModelConfig, ssl_feature_extractor: SSLFeatureExtractor):
@@ -243,6 +246,22 @@ class MioCodecModel(nn.Module):
         )
         logger.debug(f"Wave post_net: {config.wave_resnet_num_blocks} ResNet blocks")
 
+        # UpSampler for higher sample rates (e.g., 44.1kHz)
+        self.wave_upsampler = None
+        if config.wave_upsampler_factors:
+            upsample_factors = list(config.wave_upsampler_factors)
+            kernel_sizes = list(config.wave_upsampler_kernel_sizes) if config.wave_upsampler_kernel_sizes else None
+            self.wave_upsampler = UpSamplerBlock(
+                in_channels=wave_dim,
+                upsample_factors=upsample_factors,
+                kernel_sizes=kernel_sizes,
+                num_groups=config.wave_resnet_num_groups,
+            )
+            logger.debug(
+                f"Wave upsampler initialized: factors={upsample_factors}, "
+                f"total={self.wave_upsampler.total_upsample_factor}x"
+            )
+
         # ISTFT head for waveform synthesis
         self.istft_head = ISTFTHead(
             dim=wave_dim,
@@ -297,11 +316,23 @@ class MioCodecModel(nn.Module):
             return (audio_length - self.config.n_fft) // self.config.hop_length + 1
 
     def _calculate_target_stft_length(self, audio_length: int) -> int:
-        """Calculate the target STFT frame length based on audio length for wave decoder."""
+        """Calculate the target STFT frame length based on audio length for wave decoder.
+
+        When wave_upsampler is configured, this returns the frame length BEFORE upsampling
+        (i.e., the length that wave_post_net should output). The upsampler will then
+        expand it to the actual STFT frame length.
+        """
         if self.config.istft_padding == "same":
-            return audio_length // self.config.hop_length
+            istft_frames = audio_length // self.config.hop_length
         else:  # center
-            return audio_length // self.config.hop_length + 1
+            istft_frames = audio_length // self.config.hop_length + 1
+
+        # If upsampler is configured, return the length before upsampling
+        if self.wave_upsampler is not None:
+            # istft_frames = pre_upsample_length * total_upsample_factor
+            return istft_frames // self.wave_upsampler.total_upsample_factor
+
+        return istft_frames
 
     def _process_ssl_features(self, features: list[torch.Tensor], layers: list[int]) -> torch.Tensor:
         if len(layers) > 1:
@@ -481,6 +512,11 @@ class MioCodecModel(nn.Module):
 
         # Post ResNet blocks
         local_latent = self.wave_post_net(local_latent.transpose(1, 2)).transpose(1, 2)
+
+        # Apply upsampler if configured (for higher sample rates like 44.1kHz)
+        if self.wave_upsampler is not None:
+            # wave_upsampler expects (B, C, L) and outputs (B, L', C)
+            local_latent = self.wave_upsampler(local_latent.transpose(1, 2))
 
         # ISTFT head: predict magnitude + phase and synthesize waveform
         waveform = self.istft_head(local_latent)  # (B, samples)
